@@ -470,19 +470,29 @@ app.get('/reanalyze-all', async (req, res) => {
                 rawText = rawText.replace(/```json|```/g, '').trim();
                 const ai = JSON.parse(rawText);
 
-                await pool.query(`
-                    UPDATE leads_analisados 
-                    SET 
-                        resumo_ia = $1, interesse_lead = $2, urgencia = $3, 
-                        probabilidade = $4, temperatura_lead = $5, proximo_passo = $6,
-                        nome_lead = $7, resumo = $8
-                    WHERE id = $9
-                `, [
+                // Só atualiza nome_lead se a IA encontrou um nome real
+                const nomeLeadFinal = (ai.nome_lead && ai.nome_lead !== 'Não informado') 
+                    ? ai.nome_lead 
+                    : undefined;
+
+                const campos = [`resumo_ia = $1, interesse_lead = $2, urgencia = $3, probabilidade = $4, temperatura_lead = $5, proximo_passo = $6, resumo = $7`];
+                const valores = [
                     ai.resumo_ia, ai.interesse_lead || 'Geral', ai.urgencia || 'baixa',
                     parseInt(ai.probabilidade) || 0, ai.temperatura_lead || 'Frio', ai.proximo_passo || 'Aguardar',
-                    ai.nome_lead || lead.id, ai.resumo_ia || lead.resumo,
-                    lead.id
-                ]);
+                    ai.resumo_ia
+                ];
+
+                if (nomeLeadFinal) {
+                    campos.push(`nome_lead = $${valores.length + 1}`);
+                    valores.push(nomeLeadFinal);
+                }
+                valores.push(lead.id);
+
+                await pool.query(`
+                    UPDATE leads_analisados 
+                    SET ${campos.join(', ')}
+                    WHERE id = $${valores.length}
+                `, valores);
                 
                 atualizados++;
                 logs.push(`ID ${lead.id} OK: ${ai.resumo_ia?.substring(0, 30)}...`);
