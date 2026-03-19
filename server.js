@@ -90,7 +90,7 @@ Lead ${i + 1}:
         Gere uma Diretiva Executiva com: PONTOS FORTES, GAPS CRÍTICOS, PRODUTOS SUGERIDOS e PLANO DE AÇÃO. Seja direto e executivo.`;
 
         const geminiRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -184,7 +184,7 @@ app.post('/webhook', async (req, res) => {
         - nome_empresa, urgencia, resumo, resumo_ia (estratégico), interesse_lead, produto_ofertado, nome_lead, objecoes, gaps, probabilidade (0-100), temperatura_lead, proximo_passo.`;
 
         const geminiRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -448,7 +448,7 @@ app.get('/reanalyze-all', async (req, res) => {
                 JSON SCHEMA: { "resumo_ia": "curto e estratégico", "interesse_lead": "produto", "urgencia": "baixa/media/alta", "nome_lead": "nome completo", "probabilidade": 0-100, "temperatura_lead": "Frio/Morno/Quente", "proximo_passo": "ação" }`;
 
                 const geminiRes = await fetch(
-                    `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
