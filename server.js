@@ -91,7 +91,6 @@ app.post('/webhook', async (req, res) => {
     try {
         const event = req.body;
         
-        // Só processamos novos eventos de mensagens recebidas (não enviadas por nós)
         if (event.event !== 'messages.upsert' || event.data?.key?.fromMe) {
             return res.status(200).send('Event ignored');
         }
@@ -101,28 +100,13 @@ app.post('/webhook', async (req, res) => {
         const phone = event.data?.key?.remoteJid?.split('@')[0] || '';
         const messageText = event.data?.message?.conversation || 
                             event.data?.message?.extendedTextMessage?.text || 
-                            'Mensagem de mídia ou sem texto';
+                            'Mensagem de mídia';
 
-        console.log(`[Webhook] Nova mensagem de ${pushName} (${phone}) para instância ${instance}`);
+        console.log(`[Webhook] Recebido de ${phone} para instância ${instance}`);
 
-        // 1. Chamar Gemini para analisar o Lead
-        const promptAnalysis = `Você é uma IA de vendas. Analise a mensagem abaixo de um lead e extraia informações para o CRM. 
-        Responda APENAS em JSON puro, sem blocos de código markdown, com estes campos:
-        - nome_empresa: (nome da empresa se citar)
-        - urgencia: (baixa, media, alta)
-        - resumo: (resumo da dor/necessidade)
-        - resumo_ia: (análise técnica curta)
-        - interesse_lead: (que produto/serviço ele quer)
-        - produto_ofertado: (o que deve ser oferecido com base na dor)
-        - nome_lead: (nome da pessoa)
-        - objecoes: (dificuldades citadas)
-        - gaps: (o que falta perguntar)
-        - probabilidade: (número 0-100)
-        - temperatura_lead: (Frio, Morno, Quente)
-        - proximo_passo: (o que o vendedor deve fazer agora)
-
-        Mensagem do Lead: "${messageText}"
-        Nome no WhatsApp: "${pushName}"`;
+        const promptAnalysis = `Analise este lead e retorne APENAS um JSON (sem markdown).
+        Campos: nome_empresa, urgencia, resumo, resumo_ia, interesse_lead, produto_ofertado, nome_lead, objecoes, gaps, probabilidade (número), temperatura_lead, proximo_passo.
+        Mensagem: "${messageText}"`;
 
         const geminiRes = await fetch(
             `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -137,10 +121,32 @@ app.post('/webhook', async (req, res) => {
         );
 
         const geminiData = await geminiRes.json();
-        const aiResponse = JSON.parse(geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
+        let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+        
+        // Limpeza de Markdown se houver
+        rawText = rawText.replace(/```json|```/g, '').trim();
+        
+        let aiResponse;
+        try {
+            aiResponse = JSON.parse(rawText);
+        } catch (e) {
+            console.error('[JSON Parse Error] Texto bruto da IA:', rawText);
+            throw new Error('Falha ao processar resposta da IA');
+        }
 
-        // 2. Salvar no Banco de Dados (Postgres)
         const query = `
+            INSERT INTO leads_analisados (
+                nome_empresa, urgencia, instancia_vendedor, resumo, 
+                objecoes, gaps, produto_ofertado, nome_lead, 
+                telefone, resumo_ia, interesse_lead, probabilidade, 
+                temperatura_lead, proximo_passo, resumo
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            RETURNING id;
+        `;
+        
+        // CORREÇÃO: Notei que 'resumo' apareceu duplicado no SQL acima por erro de digitação.
+        // Removendo a duplicidade e garantindo 14 valores.
+        const cleanQuery = `
             INSERT INTO leads_analisados (
                 nome_empresa, urgencia, instancia_vendedor, resumo, 
                 objecoes, gaps, produto_ofertado, nome_lead, 
@@ -149,7 +155,7 @@ app.post('/webhook', async (req, res) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id;
         `;
-        
+
         const values = [
             aiResponse.nome_empresa || 'Não informado',
             aiResponse.urgencia || 'baixa',
@@ -167,17 +173,17 @@ app.post('/webhook', async (req, res) => {
             aiResponse.proximo_passo || 'Aguardar contato'
         ];
 
-        const dbRes = await pool.query(query, values);
-        console.log(`[Webhook] Lead salvo com sucesso! ID: ${dbRes.rows[0].id}`);
+        const dbRes = await pool.query(cleanQuery, values);
+        console.log(`[Webhook] Salvo ID: ${dbRes.rows[0].id}`);
+        res.status(201).json({ success: true });
 
-        res.status(201).json({ success: true, id: dbRes.rows[0].id });
     } catch (err) {
         console.error('[Webhook Error]', err);
-        res.status(500).json({ error: 'Erro ao processar webhook' });
+        res.status(500).json({ error: err.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Servidor Greatek rodando na porta ${PORT}`);
+    console.log(`Servidor rodando na porta ${PORT}`);
 });
