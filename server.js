@@ -183,6 +183,78 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
+// --- Rota para buscar um lead específico pelo ID ---
+app.get('/leads/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('SELECT * FROM leads_analisados WHERE id = $1', [id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Lead não encontrado' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro ao buscar detalhes do lead' });
+    }
+});
+
+// --- Rota para deletar um lead ---
+app.delete('/leads/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await pool.query('DELETE FROM leads_analisados WHERE id = $1', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro ao deletar lead' });
+    }
+});
+
+// --- Rota para atualizar um lead ---
+app.put('/leads/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { nome_lead, nome_empresa, urgencia, temperatura_lead, situacao } = req.body;
+        
+        const query = `
+            UPDATE leads_analisados 
+            SET nome_lead = $1, nome_empresa = $2, urgencia = $3, temperatura_lead = $4 
+            WHERE id = $5
+        `;
+        await pool.query(query, [nome_lead, nome_empresa, urgencia, temperatura_lead, id]);
+        
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro ao atualizar lead' });
+    }
+});
+
+// --- Rota para histórico de conversa (simplificado) ---
+app.get('/leads/:id/historico', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('SELECT resumo, resumo_ia FROM leads_analisados WHERE id = $1', [id]);
+        
+        if (result.rows.length === 0) return res.json([]);
+        
+        // Retorna o resumo como se fosse a primeira entrada do histórico
+        const history = [{
+            id: 'h1',
+            role: 'lead',
+            content: result.rows[0].resumo,
+            timestamp: new Date().toISOString()
+        }];
+        
+        res.json(history);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro ao buscar histórico' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
