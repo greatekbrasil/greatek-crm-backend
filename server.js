@@ -12,6 +12,26 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
+// Inicialização do Banco de Dados (Tabela de Histórico Permanente)
+async function initDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historico_conversas (
+                id SERIAL PRIMARY KEY,
+                instancia_vendedor TEXT,
+                remote_jid TEXT,
+                content TEXT,
+                role TEXT, -- 'lead' ou 'vendedor'
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log('--- [DB] Tabela de histórico verificada/criada! ---');
+    } catch (err) {
+        console.error('--- [DB ERROR] Erro ao criar tabela de histórico:', err);
+    }
+}
+initDB();
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // --- Rota de Leads (Listagem) ---
@@ -86,41 +106,72 @@ Lead ${i + 1}:
     }
 });
 
+// Configurações da EvolutionAPI (para buscar histórico)
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL || 'https://evolution-api-production-234a.up.railway.app';
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || '8A0B3E736A0F-49B5-8A35-99E4D699907C';
+
 // --- WEBHOOK: Recebe mensagens da EvolutionAPI e processa com IA ---
 app.post('/webhook', async (req, res) => {
     try {
         const event = req.body;
         
-        if (event.event !== 'messages.upsert' || event.data?.key?.fromMe) {
+        if (event.event !== 'messages.upsert') {
             return res.status(200).send('Event ignored');
         }
 
         const instance = event.instance;
-        const pushName = event.data?.pushName || 'Lead Desconhecido';
+        const fromMe = event.data?.key?.fromMe;
+        const pushName = event.data?.pushName || 'Desconhecido';
         const phone = event.data?.key?.remoteJid?.split('@')[0] || '';
+        const remoteJid = event.data?.key?.remoteJid;
         const messageText = event.data?.message?.conversation || 
                             event.data?.message?.extendedTextMessage?.text || 
                             'Mensagem de mídia';
 
-        console.log(`[Webhook] Recebido de ${phone} para instância ${instance}`);
+        console.log(`[Webhook] Mensagem de ${phone} (${fromMe ? 'Vendedor' : 'Lead'}) na instância ${instance}`);
 
-        const promptAnalysis = `Você é um analista comercial sênior da Greatek. Analise a mensagem de um lead e retorne um JSON puro.
+        // 1. SALVAR NO HISTÓRICO PERMANENTE (Tudo o que entra e sai)
+        const historyQuery = `
+            INSERT INTO historico_conversas (instancia_vendedor, remote_jid, content, role)
+            VALUES ($1, $2, $3, $4);
+        `;
+        await pool.query(historyQuery, [instance, remoteJid, messageText, fromMe ? 'vendedor' : 'lead']);
+
+        // 2. SE FOR MENSAGEM DO VENDEDOR, APENAS ARQUIVAMOS E PARAMOS AQUI
+        if (fromMe) {
+            return res.status(200).send('Message archived');
+        }
+
+        // 3. SE FOR LEAD, BUSCAR CONTEXTO PARA ANÁLISE IA
+        let historicoTexto = "Nenhum histórico anterior.";
+        try {
+            // Busca os últimos 15 do banco local (mais rápido que chamar API externa toda hora)
+            const localHist = await pool.query(
+                'SELECT role, content FROM historico_conversas WHERE remote_jid = $1 ORDER BY id DESC LIMIT 15',
+                [remoteJid]
+            );
+            if (localHist.rows.length > 0) {
+                historicoTexto = localHist.rows
+                    .map(m => `${m.role === 'vendedor' ? 'Vendedor' : 'Lead'}: ${m.content}`)
+                    .reverse()
+                    .join('\n');
+            }
+        } catch (hErr) {
+            console.error('[History Fetch Error]', hErr.message);
+        }
+
+        // 4. Chamar Gemini para analisar o Lead com Contexto
+        const promptAnalysis = `Você é um analista comercial sênior da Greatek. 
+        Analise a conversa abaixo e retorne um JSON puro.
+        
+        HISTÓRICO RECENTE:
+        ${historicoTexto}
+        
+        MENSAGEM ATUAL:
+        "${messageText}"
+        
         CAMPOS REQUERIDOS:
-        - nome_empresa: (se houver)
-        - urgencia: (baixa, media, alta)
-        - resumo: (resumo fático do que ele disse)
-        - resumo_ia: (ANÁLISE ESTRATÉGICA curta sobre a dor e como o vendedor deve agir para fechar)
-        - interesse_lead: (que produto/serviço ele busca)
-        - produto_ofertado: (o que a Greatek deve oferecer)
-        - nome_lead: (nome completo se tiver)
-        - objecoes: (principais barreiras citadas)
-        - gaps: (o que faltou para qualificar o lead)
-        - probabilidade: (número 0-100)
-        - temperatura_lead: (Frio, Morno, Quente)
-        - proximo_passo: (recomendação de ação imediata)
-
-        Mensagem: "${messageText}"
-        Remetente: "${pushName}"`;
+        - nome_empresa, urgencia, resumo, resumo_ia (estratégico), interesse_lead, produto_ofertado, nome_lead, objecoes, gaps, probabilidade (0-100), temperatura_lead, proximo_passo.`;
 
         const geminiRes = await fetch(
             `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -248,26 +299,77 @@ app.put('/leads/:id', async (req, res) => {
     }
 });
 
-// --- Rota para histórico de conversa (simplificado) ---
+// --- Rota para histórico de conversa (Real e Permanente) ---
 app.get('/leads/:id/historico', async (req, res) => {
     try {
         const { id } = req.params;
-        const result = await pool.query('SELECT resumo, resumo_ia FROM leads_analisados WHERE id = $1', [id]);
         
-        if (result.rows.length === 0) return res.json([]);
+        // 1. Buscar o telefone do lead
+        const leadRes = await pool.query('SELECT telefone FROM leads_analisados WHERE id = $1', [id]);
+        if (leadRes.rows.length === 0) return res.status(404).json({ error: 'Lead não encontrado' });
         
-        // Retorna o resumo como se fosse a primeira entrada do histórico
-        const history = [{
-            id: 'h1',
-            role: 'lead',
-            content: result.rows[0].resumo,
-            timestamp: new Date().toISOString()
-        }];
+        const phone = leadRes.rows[0].telefone;
+        const remoteJid = `${phone}@s.whatsapp.net`;
+
+        // 2. Buscar histórico no banco local
+        const historyRes = await pool.query(
+            'SELECT role, content, timestamp FROM historico_conversas WHERE remote_jid = $1 ORDER BY timestamp ASC',
+            [remoteJid]
+        );
         
-        res.json(history);
+        res.json(historyRes.rows.map((m, i) => ({
+            id: `h-${i}`,
+            role: m.role,
+            content: m.content,
+            timestamp: m.timestamp
+        })));
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Erro ao buscar histórico' });
+        res.status(500).json({ error: 'Erro ao buscar histórico real' });
+    }
+});
+
+// --- Rota para Sincronizar Histórico Retroativo do EvolutionAPI ---
+app.get('/sync-history/:vendedor', async (req, res) => {
+    try {
+        const { vendedor } = req.params; // instancia
+        const leadsRes = await pool.query('SELECT telefone FROM leads_analisados WHERE instancia_vendedor = $1', [vendedor]);
+        
+        let totalSincronizado = 0;
+
+        for (const lead of leadsRes.rows) {
+            const remoteJid = `${lead.telefone}@s.whatsapp.net`;
+            try {
+                const evRes = await fetch(`${EVOLUTION_API_URL}/chat/fetchMessages`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
+                    body: JSON.stringify({ instance: vendedor, where: { remoteJid }, limit: 50 })
+                });
+                const messages = await evRes.json();
+                
+                if (Array.isArray(messages)) {
+                    for (const m of messages) {
+                        if (!m.message) continue;
+                        const text = m.message.conversation || m.message.extendedTextMessage?.text || 'Mídia';
+                        const role = m.key.fromMe ? 'vendedor' : 'lead';
+                        const ts = new Date(m.messageTimestamp * 1000);
+
+                        await pool.query(`
+                            INSERT INTO historico_conversas (instancia_vendedor, remote_jid, content, role, timestamp)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT DO NOTHING; -- Ignora se já existir
+                        `, [vendedor, remoteJid, text, role, ts]);
+                        totalSincronizado++;
+                    }
+                }
+            } catch (e) {
+                console.warn(`[Sync] Falha para ${remoteJid}:`, e.message);
+            }
+        }
+        res.json({ success: true, messagesSynced: totalSincronizado });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro no sincronismo retroativo' });
     }
 });
 
