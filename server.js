@@ -392,17 +392,18 @@ app.get('/sync-history/:vendedor', async (req, res) => {
     }
 });
 
-// --- Rota Manual para Reanalisar Todos os Leads sem IA (Puxando Histórico Real) ---
+// --- Rota Manual para Reanalisar Todos os Leads sem IA (Super Robusta) ---
 app.get('/reanalyze-all', async (req, res) => {
     try {
-        console.log('[Reanalyze] Reprocessamento profundo iniciado...');
-        // Busca leads sem IA ou com placeholders
+        console.log('--- [MASS REANALYZE START] ---');
         const leadsRes = await pool.query(`
             SELECT id, telefone, resumo, instancia_vendedor 
             FROM leads_analisados 
             WHERE resumo_ia IS NULL OR resumo_ia = '' OR resumo_ia LIKE '%Sem resumo%'
+            ORDER BY id DESC LIMIT 15
         `);
         
+        let logs = [];
         let atualizados = 0;
 
         for (const lead of leadsRes.rows) {
@@ -410,59 +411,41 @@ app.get('/reanalyze-all', async (req, res) => {
                 const remoteJid = `${lead.telefone}@s.whatsapp.net`;
                 const instance = lead.instancia_vendedor;
 
-                // 1. FORÇAR busca de histórico real na EvolutionAPI (para garantir contexto)
-                console.log(`[Reanalyze] Sincronizando ${lead.telefone}...`);
-                try {
-                    const evRes = await fetch(`${EVOLUTION_API_URL}/chat/fetchMessages`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
-                        body: JSON.stringify({ instance, where: { remoteJid }, limit: 20 })
-                    });
-                    const messages = await evRes.json();
-                    
-                    if (Array.isArray(messages)) {
-                        for (const m of messages) {
-                            if (!m.message) continue;
-                            const text = m.message.conversation || m.message.extendedTextMessage?.text || 'Mídia';
-                            const role = m.key.fromMe ? 'vendedor' : 'lead';
-                            const ts = new Date(m.messageTimestamp * 1000);
+                console.log(`[Sync] ${lead.telefone}...`);
+                const evRes = await fetch(`${EVOLUTION_API_URL}/chat/fetchMessages`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
+                    body: JSON.stringify({ instance, where: { remoteJid }, limit: 15 })
+                });
+                const messages = await evRes.json();
+                
+                if (Array.isArray(messages)) {
+                    for (const m of messages) {
+                        if (!m.message) continue;
+                        const text = m.message.conversation || m.message.extendedTextMessage?.text || 'Mídia';
+                        const role = m.key.fromMe ? 'vendedor' : 'lead';
+                        const ts = m.messageTimestamp ? new Date(m.messageTimestamp * 1000) : new Date();
 
-                            await pool.query(`
-                                INSERT INTO historico_conversas (instancia_vendedor, remote_jid, content, role, timestamp)
-                                VALUES ($1, $2, $3, $4, $5)
-                                ON CONFLICT DO NOTHING;
-                            `, [instance, remoteJid, text, role, ts]);
-                        }
+                        await pool.query(`
+                            INSERT INTO historico_conversas (instancia_vendedor, remote_jid, content, role, timestamp)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT DO NOTHING;
+                        `, [instance, remoteJid, text, role, ts]);
                     }
-                } catch (e) {
-                    console.warn(`[Reanalyze Sync Fail] ${lead.telefone}:`, e.message);
                 }
 
-                // 2. Agora busca o histórico recém-sincronizado do banco local
                 const localHist = await pool.query(
                     'SELECT role, content FROM historico_conversas WHERE remote_jid = $1 ORDER BY timestamp DESC LIMIT 20',
                     [remoteJid]
                 );
                 
-                if (localHist.rows.length === 0) {
-                    console.log(`[Reanalyze] Pular ${lead.id}: Nenhum histórico real encontrado.`);
-                    continue;
-                }
+                const context = localHist.rows.length > 0 
+                  ? localHist.rows.map(m => `${m.role}: ${m.content}`).reverse().join('\n')
+                  : `(Apenas mensagem inicial): ${lead.resumo}`;
 
-                const context = localHist.rows
-                    .map(m => `${m.role === 'vendedor' ? 'Vendedor' : 'Lead'}: ${m.content}`)
-                    .reverse()
-                    .join('\n');
-
-                // 3. Chama Gemini com Contexto REAL
-                const prompt = `Você é um analista comercial sênior da Greatek. 
-                Analise a sequência de mensagens abaixo e extraia inteligência comercial.
-                
-                CONVERSA:
-                ${context}
-                
-                Retorne JSON puro com os campos: 
-                nome_empresa, urgencia (baixa, media, alta), resumo (fato), resumo_ia (estratégico), interesse_lead, produto_ofertado, nome_lead, objecoes, gaps, probabilidade (0-100), temperatura_lead, proximo_passo.`;
+                const prompt = `Analise este lead e retorne APENAS um JSON válido.
+                CONVERSA:\n${context}\n
+                JSON SCHEMA: { "resumo_ia": "curto e estratégico", "interesse_lead": "produto", "urgencia": "baixa/media/alta", "nome_lead": "nome completo", "probabilidade": 0-100, "temperatura_lead": "Frio/Morno/Quente", "proximo_passo": "ação" }`;
 
                 const geminiRes = await fetch(
                     `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -471,45 +454,41 @@ app.get('/reanalyze-all', async (req, res) => {
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             contents: [{ parts: [{ text: prompt }] }],
-                            generationConfig: { temperature: 0.1, responseMimeType: "application/json" }
+                            generationConfig: { temperature: 0.2 }
                         })
                     }
                 );
                 const geminiData = await geminiRes.json();
-                
                 if (geminiData.error) throw new Error(geminiData.error.message);
 
                 let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
                 rawText = rawText.replace(/```json|```/g, '').trim();
                 const ai = JSON.parse(rawText);
 
-                // 4. Atualiza banco com dados QUALIFICADOS
                 await pool.query(`
                     UPDATE leads_analisados 
                     SET 
                         resumo_ia = $1, interesse_lead = $2, urgencia = $3, 
                         probabilidade = $4, temperatura_lead = $5, proximo_passo = $6,
-                        resumo = $7, nome_lead = $8, nome_empresa = $9,
-                        objecoes = $10, gaps = $11, produto_ofertado = $12
-                    WHERE id = $13
+                        nome_lead = $7, resumo = $8
+                    WHERE id = $9
                 `, [
-                    ai.resumo_ia, ai.interesse_lead, ai.urgencia, 
-                    parseInt(ai.probabilidade) || 0, ai.temperatura_lead, ai.proximo_passo,
-                    ai.resumo || lead.resumo, ai.nome_lead || lead.nome_lead, ai.nome_empresa || lead.nome_empresa,
-                    ai.objecoes, ai.gaps, ai.produto_ofertado,
+                    ai.resumo_ia, ai.interesse_lead || 'Geral', ai.urgencia || 'baixa',
+                    parseInt(ai.probabilidade) || 0, ai.temperatura_lead || 'Frio', ai.proximo_passo || 'Aguardar',
+                    ai.nome_lead || lead.id, ai.resumo_ia || lead.resumo,
                     lead.id
                 ]);
                 
                 atualizados++;
-                console.log(`[Reanalyze] Sucesso total para ID: ${lead.id}`);
-            } catch (innerErr) {
-                console.error(`[Reanalyze Error] Falha no ID ${lead.id}:`, innerErr.message);
+                logs.push(`ID ${lead.id} OK: ${ai.resumo_ia?.substring(0, 30)}...`);
+            } catch (err) {
+                logs.push(`ID ${lead.id} FAIL: ${err.message}`);
             }
         }
-        res.json({ success: true, processed: leadsRes.rows.length, updated: atualizados });
+        res.json({ success: true, updatedCount: atualizados, details: logs });
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Erro no reprocessamento profundo' });
+        res.status(500).json({ error: err.message });
     }
 });
 
