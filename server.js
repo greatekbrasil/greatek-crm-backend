@@ -155,6 +155,20 @@ app.post('/webhook', async (req, res) => {
                 telefone, resumo_ia, interesse_lead, probabilidade, 
                 temperatura_lead, proximo_passo
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (telefone) DO UPDATE SET
+                nome_empresa = EXCLUDED.nome_empresa,
+                urgencia = EXCLUDED.urgencia,
+                instancia_vendedor = EXCLUDED.instancia_vendedor,
+                resumo = EXCLUDED.resumo,
+                objecoes = EXCLUDED.objecoes,
+                gaps = EXCLUDED.gaps,
+                produto_ofertado = EXCLUDED.produto_ofertado,
+                nome_lead = EXCLUDED.nome_lead,
+                resumo_ia = EXCLUDED.resumo_ia,
+                interesse_lead = EXCLUDED.interesse_lead,
+                probabilidade = EXCLUDED.probabilidade,
+                temperatura_lead = EXCLUDED.temperatura_lead,
+                proximo_passo = EXCLUDED.proximo_passo
             RETURNING id;
         `;
 
