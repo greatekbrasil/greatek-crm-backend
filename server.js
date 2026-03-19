@@ -55,18 +55,22 @@ app.get('/leads', async (req, res) => {
     }
 });
 
+const normalizeId = (id) => id ? id.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, '_') : '';
+
 // --- Rota da Diretiva Executiva IA ---
 app.get('/diretiva/:vendedor', async (req, res) => {
     try {
         const { vendedor } = req.params;
+        const normalizedVendedor = normalizeId(vendedor);
+
         const result = await pool.query(
             'SELECT * FROM leads_analisados WHERE instancia_vendedor = $1 ORDER BY id DESC LIMIT 20',
-            [vendedor]
+            [normalizedVendedor]
         );
         const leads = result.rows;
 
         if (leads.length === 0) {
-            return res.json({ diretiva: 'Nenhum lead registrado para este vendedor ainda.' });
+            return res.json({ diretiva: `Nenhum lead encontrado para [${normalizedVendedor}].` });
         }
 
         const leadsTexto = leads.map((l, i) => `
@@ -82,8 +86,8 @@ Lead ${i + 1}:
 - Próximo passo: ${l.proximo_passo || 'Não definido'}
 `).join('\n');
 
-        const prompt = `Você é um diretor comercial sênior. Analise o vendedor ${vendedor} com base nos seguintes leads do CRM:\n${leadsTexto}\n
-        Gere uma Diretiva Executiva com: PONTOS FORTES, GAPS CRÍTICOS, PRODUTOS SUGERIDOS, PLANO DE AÇÃO e POTENCIAL DE RECEITA. Seja direto e executivo.`;
+        const prompt = `Você é um diretor comercial sênior da Greatek. Analise o vendedor ${normalizedVendedor} com base nos seguintes leads:\n${leadsTexto}\n
+        Gere uma Diretiva Executiva com: PONTOS FORTES, GAPS CRÍTICOS, PRODUTOS SUGERIDOS e PLANO DE AÇÃO. Seja direto e executivo.`;
 
         const geminiRes = await fetch(
             `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -98,8 +102,14 @@ Lead ${i + 1}:
         );
 
         const geminiData = await geminiRes.json();
+
+        if (geminiData.error) {
+            console.error('[Gemini API Error]', geminiData.error);
+            return res.status(500).json({ diretiva: `Erro na IA: ${geminiData.error.message}` });
+        }
+
         const diretiva = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-        res.json({ diretiva: diretiva || 'Erro ao gerar diretiva via IA.' });
+        res.json({ diretiva: diretiva || 'A IA não gerou conteúdo.' });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Erro ao gerar diretiva executiva.' });
@@ -186,17 +196,26 @@ app.post('/webhook', async (req, res) => {
         );
 
         const geminiData = await geminiRes.json();
-        let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
         
-        // Limpeza de Markdown se houver
+        if (geminiData.error) {
+            console.error('[Gemini Webhook Error]', geminiData.error);
+            // Salva apenas o básico se a IA falhar
+            await pool.query(`
+                INSERT INTO leads_analisados (instancia_vendedor, telefone, nome_lead, resumo)
+                VALUES ($1, $2, $3, $4) ON CONFLICT (telefone) DO UPDATE SET resumo = EXCLUDED.resumo;
+            `, [instance, phone, pushName, messageText]);
+            return res.status(200).send('Archived without analysis due to AI error');
+        }
+
+        let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
         rawText = rawText.replace(/```json|```/g, '').trim();
         
         let aiResponse;
         try {
             aiResponse = JSON.parse(rawText);
         } catch (e) {
-            console.error('[JSON Parse Error] Texto bruto da IA:', rawText);
-            throw new Error('Falha ao processar resposta da IA: ' + rawText.substring(0, 100));
+            console.error('[JSON Parse Error]', rawText);
+            throw new Error('Falha ao processar resposta da IA');
         }
 
         const cleanQuery = `
