@@ -104,9 +104,23 @@ app.post('/webhook', async (req, res) => {
 
         console.log(`[Webhook] Recebido de ${phone} para instância ${instance}`);
 
-        const promptAnalysis = `Analise este lead e retorne APENAS um JSON (sem markdown).
-        Campos: nome_empresa, urgencia, resumo, resumo_ia, interesse_lead, produto_ofertado, nome_lead, objecoes, gaps, probabilidade (número), temperatura_lead, proximo_passo.
-        Mensagem: "${messageText}"`;
+        const promptAnalysis = `Você é um analista comercial sênior da Greatek. Analise a mensagem de um lead e retorne um JSON puro.
+        CAMPOS REQUERIDOS:
+        - nome_empresa: (se houver)
+        - urgencia: (baixa, media, alta)
+        - resumo: (resumo fático do que ele disse)
+        - resumo_ia: (ANÁLISE ESTRATÉGICA curta sobre a dor e como o vendedor deve agir para fechar)
+        - interesse_lead: (que produto/serviço ele busca)
+        - produto_ofertado: (o que a Greatek deve oferecer)
+        - nome_lead: (nome completo se tiver)
+        - objecoes: (principais barreiras citadas)
+        - gaps: (o que faltou para qualificar o lead)
+        - probabilidade: (número 0-100)
+        - temperatura_lead: (Frio, Morno, Quente)
+        - proximo_passo: (recomendação de ação imediata)
+
+        Mensagem: "${messageText}"
+        Remetente: "${pushName}"`;
 
         const geminiRes = await fetch(
             `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
@@ -131,21 +145,9 @@ app.post('/webhook', async (req, res) => {
             aiResponse = JSON.parse(rawText);
         } catch (e) {
             console.error('[JSON Parse Error] Texto bruto da IA:', rawText);
-            throw new Error('Falha ao processar resposta da IA');
+            throw new Error('Falha ao processar resposta da IA: ' + rawText.substring(0, 100));
         }
 
-        const query = `
-            INSERT INTO leads_analisados (
-                nome_empresa, urgencia, instancia_vendedor, resumo, 
-                objecoes, gaps, produto_ofertado, nome_lead, 
-                telefone, resumo_ia, interesse_lead, probabilidade, 
-                temperatura_lead, proximo_passo, resumo
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            RETURNING id;
-        `;
-        
-        // CORREÇÃO: Notei que 'resumo' apareceu duplicado no SQL acima por erro de digitação.
-        // Removendo a duplicidade e garantindo 14 valores.
         const cleanQuery = `
             INSERT INTO leads_analisados (
                 nome_empresa, urgencia, instancia_vendedor, resumo, 
@@ -166,7 +168,7 @@ app.post('/webhook', async (req, res) => {
             aiResponse.produto_ofertado || 'A definir',
             aiResponse.nome_lead || pushName,
             phone,
-            aiResponse.resumo_ia || 'Análise automática',
+            aiResponse.resumo_ia || null, // Se falhar a IA, deixa o frontend mostrar o resumo bruto
             aiResponse.interesse_lead || 'Interesse geral',
             parseInt(aiResponse.probabilidade) || 0,
             aiResponse.temperatura_lead || 'Frio',
