@@ -392,6 +392,8 @@ app.get('/sync-history/:vendedor', async (req, res) => {
     }
 });
 
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
 // --- Rota Manual para Reanalisar Todos os Leads sem IA (Super Robusta) ---
 app.get('/reanalyze-all', async (req, res) => {
     try {
@@ -400,7 +402,7 @@ app.get('/reanalyze-all', async (req, res) => {
             SELECT id, telefone, resumo, instancia_vendedor 
             FROM leads_analisados 
             WHERE resumo_ia IS NULL OR resumo_ia = '' OR resumo_ia LIKE '%Sem resumo%'
-            ORDER BY id DESC LIMIT 15
+            ORDER BY id DESC LIMIT 20
         `);
         
         let logs = [];
@@ -408,6 +410,9 @@ app.get('/reanalyze-all', async (req, res) => {
 
         for (const lead of leadsRes.rows) {
             try {
+                // Pequena pausa para respeitar a cota do Plano Gratuito
+                await sleep(3000); 
+
                 const remoteJid = `${lead.telefone}@s.whatsapp.net`;
                 const instance = lead.instancia_vendedor;
 
