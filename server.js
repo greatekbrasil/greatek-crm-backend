@@ -392,6 +392,66 @@ app.get('/sync-history/:vendedor', async (req, res) => {
     }
 });
 
+// --- Rota Manual para Reanalisar Todos os Leads sem IA ---
+app.get('/reanalyze-all', async (req, res) => {
+    try {
+        console.log('[Reanalyze] Iniciando reprocessamento em massa...');
+        const leadsRes = await pool.query('SELECT id, telefone, resumo, instancia_vendedor FROM leads_analisados WHERE resumo_ia IS NULL OR resumo_ia = \'\'');
+        
+        let atualizados = 0;
+
+        for (const lead of leadsRes.rows) {
+            try {
+                const remote_jid = `${lead.telefone}@s.whatsapp.net`;
+                
+                // 1. Busca contexto histórico
+                const historyRes = await pool.query(
+                    'SELECT role, content FROM historico_conversas WHERE remote_jid = $1 ORDER BY id DESC LIMIT 10',
+                    [remote_jid]
+                );
+                const context = historyRes.rows.map(m => `${m.role}: ${m.content}`).reverse().join('\n');
+
+                // 2. Chama Gemini
+                const prompt = `Analise a conversa abaixo para o lead ${lead.telefone}. 
+                CONTEXTO:\n${context}\nCONVERSA ATUAL:\n${lead.resumo}\n
+                Retorne JSON puro: { "resumo_ia": "estrategia", "interesse_lead": "produto", "urgencia": "alta/media/baixa", "probabilidade": 0-100, "temperatura_lead": "Frio/Morno/Quente", "proximo_passo": "acao" }`;
+
+                const geminiRes = await fetch(
+                    `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [{ parts: [{ text: prompt }] }],
+                            generationConfig: { temperature: 0.1, responseMimeType: "application/json" }
+                        })
+                    }
+                );
+                const geminiData = await geminiRes.json();
+                let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+                rawText = rawText.replace(/```json|```/g, '').trim();
+                const ai = JSON.parse(rawText);
+
+                // 3. Atualiza banco
+                await pool.query(`
+                    UPDATE leads_analisados 
+                    SET resumo_ia = $1, interesse_lead = $2, urgencia = $3, probabilidade = $4, temperatura_lead = $5, proximo_passo = $6
+                    WHERE id = $7
+                `, [ai.resumo_ia, ai.interesse_lead, ai.urgencia, ai.probabilidade, ai.temperatura_lead, ai.proximo_passo, lead.id]);
+                
+                atualizados++;
+                console.log(`[Reanalyze] Sucesso para ID: ${lead.id}`);
+            } catch (innerErr) {
+                console.error(`[Reanalyze Error] Falha no ID ${lead.id}:`, innerErr.message);
+            }
+        }
+        res.json({ success: true, processed: leadsRes.rows.length, updated: atualizados });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro no processamento em massa' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
