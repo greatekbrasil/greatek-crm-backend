@@ -543,52 +543,58 @@ app.get('/reanalyze-all', async (req, res) => {
 
 // --- Rota para Gerar Resumos IA Completos para Leads Vazios ---
 app.get('/fill-missing', async (req, res) => {
-    try {
-        console.log('--- [FILL MISSING WITH AI START] ---');
+    // 1. Responde imediatamente para não dar timeout no navegador/Railway (que leva > 4 min)
+    res.json({ 
+        success: true, 
+        message: 'Processamento iniciado em segundo plano. Pressione F12 e veja os logs no Railway para acompanhar o progresso (aproximadamente 4 segundos por lead).' 
+    });
 
-        // Busca TODOS os leads sem análise de IA
-        const leadsRes = await pool.query(`
-            SELECT id, resumo, nome_lead, telefone, instancia_vendedor
-            FROM leads_analisados 
-            WHERE resumo_ia IS NULL OR resumo_ia = '' OR resumo_ia LIKE '%Sem resumo%'
-               OR LENGTH(resumo_ia) < 30
-            ORDER BY id DESC
-        `);
+    // 2. Continua o processamento pesado de forma assíncrona
+    (async () => {
+        try {
+            console.log('--- [FILL MISSING WITH AI START] ---');
 
-        console.log(`[Fill Missing] ${leadsRes.rows.length} leads para processar...`);
+            // Busca TODOS os leads sem análise de IA
+            const leadsRes = await pool.query(`
+                SELECT id, resumo, nome_lead, telefone, instancia_vendedor
+                FROM leads_analisados 
+                WHERE resumo_ia IS NULL OR resumo_ia = '' OR resumo_ia LIKE '%Sem resumo%'
+                   OR LENGTH(resumo_ia) < 30
+                ORDER BY id DESC
+            `);
 
-        let atualizados = 0;
-        let logs = [];
+            console.log(`[Fill Missing] ${leadsRes.rows.length} leads para processar...`);
 
-        for (const lead of leadsRes.rows) {
-            try {
-                // Pausa de 4s entre cada chamada para respeitar cota gratuita (20 req/min)
-                await sleep(4000);
+            let atualizados = 0;
 
-                const remoteJid = `${lead.telefone}@s.whatsapp.net`;
+            for (const lead of leadsRes.rows) {
+                try {
+                    // Pausa de 4s entre cada chamada para respeitar cota gratuita (20 req/min)
+                    await sleep(4000);
 
-                // 1. Busca o histórico completo da conversa no banco local
-                const histRes = await pool.query(
-                    `SELECT role, content FROM historico_conversas 
-                     WHERE remote_jid = $1 
-                     ORDER BY timestamp ASC LIMIT 30`,
-                    [remoteJid]
-                );
+                    const remoteJid = `${lead.telefone}@s.whatsapp.net`;
 
-                // 2. Monta o contexto: usa histórico completo se disponível, senão usa resumo bruto
-                let contexto;
-                if (histRes.rows.length > 0) {
-                    contexto = histRes.rows
-                        .map(m => `${m.role === 'vendedor' ? 'Vendedor' : 'Lead'}: ${m.content}`)
-                        .join('\n');
-                } else if (lead.resumo && lead.resumo.trim().length > 0) {
-                    contexto = `(Última mensagem registrada): ${lead.resumo.trim()}`;
-                } else {
-                    contexto = 'Sem histórico de conversa registrado.';
-                }
+                    // Busca o histórico completo da conversa no banco local
+                    const histRes = await pool.query(
+                        `SELECT role, content FROM historico_conversas 
+                         WHERE remote_jid = $1 
+                         ORDER BY timestamp ASC LIMIT 30`,
+                        [remoteJid]
+                    );
 
-                // 3. Prompt focado em resumo estratégico
-                const prompt = `Você é um analista comercial da Greatek, empresa de tecnologia (ISP, redes, equipamentos).
+                    // Monta o contexto
+                    let contexto;
+                    if (histRes.rows.length > 0) {
+                        contexto = histRes.rows
+                            .map(m => `${m.role === 'vendedor' ? 'Vendedor' : 'Lead'}: ${m.content}`)
+                            .join('\n');
+                    } else if (lead.resumo && lead.resumo.trim().length > 0) {
+                        contexto = `(Última mensagem registrada): ${lead.resumo.trim()}`;
+                    } else {
+                        contexto = 'Sem histórico de conversa registrado.';
+                    }
+
+                    const prompt = `Você é um analista comercial da Greatek, empresa de tecnologia (ISP, redes, equipamentos).
 Analise a conversa abaixo e retorne APENAS um JSON válido, sem markdown, sem explicações.
 
 CONVERSA:
@@ -604,54 +610,49 @@ RETORNE EXATAMENTE este JSON:
   "proximo_passo": "ação concreta recomendada para o vendedor"
 }`;
 
-                // 4. Chama Gemini com retry automático em caso de rate limit
-                const geminiData = await callGeminiWithRetry(prompt);
-                if (geminiData.error) throw new Error(geminiData.error.message);
+                    const geminiData = await callGeminiWithRetry(prompt);
+                    if (geminiData.error) throw new Error(geminiData.error.message);
 
-                let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-                rawText = rawText.replace(/```json|```/g, '').trim();
-                const ai = JSON.parse(rawText);
+                    let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+                    rawText = rawText.replace(/```json|```/g, '').trim();
+                    const ai = JSON.parse(rawText);
 
-                if (!ai.resumo_ia || ai.resumo_ia.trim().length < 10) {
-                    throw new Error('IA retornou resumo vazio ou inválido');
+                    if (!ai.resumo_ia || ai.resumo_ia.trim().length < 10) {
+                        throw new Error('IA retornou resumo vazio ou inválido');
+                    }
+
+                    await pool.query(`
+                        UPDATE leads_analisados
+                        SET 
+                            resumo_ia        = $1,
+                            interesse_lead   = COALESCE($2, NULLIF(interesse_lead, ''), 'A definir'),
+                            urgencia         = COALESCE($3, NULLIF(urgencia, ''), 'media'),
+                            temperatura_lead = COALESCE($4, NULLIF(temperatura_lead, ''), 'Morno'),
+                            probabilidade    = COALESCE($5, NULLIF(probabilidade, 0), 30),
+                            proximo_passo    = COALESCE($6, NULLIF(proximo_passo, ''), 'Aguardar retorno do vendedor')
+                        WHERE id = $7
+                    `, [
+                        ai.resumo_ia,
+                        ai.interesse_lead || null,
+                        ai.urgencia || null,
+                        ai.temperatura_lead || null,
+                        parseInt(ai.probabilidade) || null,
+                        ai.proximo_passo || null,
+                        lead.id
+                    ]);
+
+                    atualizados++;
+                    console.log(`[Fill Missing] ID ${lead.id} OK: "${ai.resumo_ia.substring(0, 60)}..."`);
+                } catch (err) {
+                    console.error(`[Fill Missing] ID ${lead.id} FAIL:`, err.message);
                 }
-
-                await pool.query(`
-                    UPDATE leads_analisados
-                    SET 
-                        resumo_ia        = $1,
-                        interesse_lead   = COALESCE($2, NULLIF(interesse_lead, ''), 'A definir'),
-                        urgencia         = COALESCE($3, NULLIF(urgencia, ''), 'media'),
-                        temperatura_lead = COALESCE($4, NULLIF(temperatura_lead, ''), 'Morno'),
-                        probabilidade    = COALESCE($5, NULLIF(probabilidade, 0), 30),
-                        proximo_passo    = COALESCE($6, NULLIF(proximo_passo, ''), 'Aguardar retorno do vendedor')
-                    WHERE id = $7
-                `, [
-                    ai.resumo_ia,
-                    ai.interesse_lead || null,
-                    ai.urgencia || null,
-                    ai.temperatura_lead || null,
-                    parseInt(ai.probabilidade) || null,
-                    ai.proximo_passo || null,
-                    lead.id
-                ]);
-
-                atualizados++;
-                logs.push(`ID ${lead.id} OK: "${ai.resumo_ia.substring(0, 60)}..."`);
-                console.log(`[Fill Missing] ID ${lead.id} OK`);
-
-            } catch (err) {
-                logs.push(`ID ${lead.id} FAIL: ${err.message}`);
-                console.error(`[Fill Missing] ID ${lead.id} FAIL:`, err.message);
             }
-        }
 
-        console.log(`--- [FILL MISSING END] ${atualizados}/${leadsRes.rows.length} leads atualizados ---`);
-        res.json({ success: true, total: leadsRes.rows.length, updatedCount: atualizados, details: logs });
-    } catch (err) {
-        console.error('[Fill Missing Error]', err);
-        res.status(500).json({ error: err.message });
-    }
+            console.log(`--- [FILL MISSING END] Processamento em background concluído: ${atualizados}/${leadsRes.rows.length} atualizados ---`);
+        } catch (err) {
+            console.error('[Fill Missing Background Error]', err);
+        }
+    })(); // O parêntese final executa a função logo após declará-la
 });
 
 const PORT = process.env.PORT || 3000;
