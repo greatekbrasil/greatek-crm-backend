@@ -541,55 +541,112 @@ app.get('/reanalyze-all', async (req, res) => {
     }
 });
 
-// --- Rota para Preencher Leads Vazios com o Resumo Bruto (Sem IA, sem rate limit) ---
+// --- Rota para Gerar Resumos IA Completos para Leads Vazios ---
 app.get('/fill-missing', async (req, res) => {
     try {
-        console.log('--- [FILL MISSING START] ---');
+        console.log('--- [FILL MISSING WITH AI START] ---');
 
-        // Busca todos os leads sem análise de IA
+        // Busca TODOS os leads sem análise de IA
         const leadsRes = await pool.query(`
-            SELECT id, resumo, nome_lead, instancia_vendedor
+            SELECT id, resumo, nome_lead, telefone, instancia_vendedor
             FROM leads_analisados 
             WHERE resumo_ia IS NULL OR resumo_ia = '' OR resumo_ia LIKE '%Sem resumo%'
+               OR LENGTH(resumo_ia) < 30
             ORDER BY id DESC
         `);
+
+        console.log(`[Fill Missing] ${leadsRes.rows.length} leads para processar...`);
 
         let atualizados = 0;
         let logs = [];
 
         for (const lead of leadsRes.rows) {
             try {
-                // Usa o resumo bruto (texto da conversa) como descrição principal
-                // Se não houver resumo, usa um texto padrão
-                const textoBase = lead.resumo && lead.resumo.trim().length > 0
-                    ? lead.resumo.trim()
-                    : 'Lead recebido via WhatsApp. Sem mensagem inicial registrada.';
+                // Pausa de 4s entre cada chamada para respeitar cota gratuita (20 req/min)
+                await sleep(4000);
 
-                // Trunca para 300 caracteres para o resumo_ia
-                const resumoIA = textoBase.length > 300
-                    ? textoBase.substring(0, 297) + '...'
-                    : textoBase;
+                const remoteJid = `${lead.telefone}@s.whatsapp.net`;
+
+                // 1. Busca o histórico completo da conversa no banco local
+                const histRes = await pool.query(
+                    `SELECT role, content FROM historico_conversas 
+                     WHERE remote_jid = $1 
+                     ORDER BY timestamp ASC LIMIT 30`,
+                    [remoteJid]
+                );
+
+                // 2. Monta o contexto: usa histórico completo se disponível, senão usa resumo bruto
+                let contexto;
+                if (histRes.rows.length > 0) {
+                    contexto = histRes.rows
+                        .map(m => `${m.role === 'vendedor' ? 'Vendedor' : 'Lead'}: ${m.content}`)
+                        .join('\n');
+                } else if (lead.resumo && lead.resumo.trim().length > 0) {
+                    contexto = `(Última mensagem registrada): ${lead.resumo.trim()}`;
+                } else {
+                    contexto = 'Sem histórico de conversa registrado.';
+                }
+
+                // 3. Prompt focado em resumo estratégico
+                const prompt = `Você é um analista comercial da Greatek, empresa de tecnologia (ISP, redes, equipamentos).
+Analise a conversa abaixo e retorne APENAS um JSON válido, sem markdown, sem explicações.
+
+CONVERSA:
+${contexto}
+
+RETORNE EXATAMENTE este JSON:
+{
+  "resumo_ia": "Resumo estratégico da conversa em 2-3 frases claras, descrevendo o contexto do lead, o que ele precisa e o estágio da negociação",
+  "interesse_lead": "produto ou serviço de interesse mencionado na conversa",
+  "urgencia": "baixa | media | alta",
+  "temperatura_lead": "Frio | Morno | Quente",
+  "probabilidade": número entre 0 e 100,
+  "proximo_passo": "ação concreta recomendada para o vendedor"
+}`;
+
+                // 4. Chama Gemini com retry automático em caso de rate limit
+                const geminiData = await callGeminiWithRetry(prompt);
+                if (geminiData.error) throw new Error(geminiData.error.message);
+
+                let rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+                rawText = rawText.replace(/```json|```/g, '').trim();
+                const ai = JSON.parse(rawText);
+
+                if (!ai.resumo_ia || ai.resumo_ia.trim().length < 10) {
+                    throw new Error('IA retornou resumo vazio ou inválido');
+                }
 
                 await pool.query(`
                     UPDATE leads_analisados
                     SET 
                         resumo_ia        = $1,
-                        interesse_lead   = COALESCE(NULLIF(interesse_lead, ''), 'A definir'),
-                        urgencia         = COALESCE(NULLIF(urgencia, ''), 'media'),
-                        temperatura_lead = COALESCE(NULLIF(temperatura_lead, ''), 'Morno'),
-                        probabilidade    = COALESCE(NULLIF(probabilidade, 0), 30),
-                        proximo_passo    = COALESCE(NULLIF(proximo_passo, ''), 'Aguardar retorno do vendedor')
-                    WHERE id = $2
-                `, [resumoIA, lead.id]);
+                        interesse_lead   = COALESCE($2, NULLIF(interesse_lead, ''), 'A definir'),
+                        urgencia         = COALESCE($3, NULLIF(urgencia, ''), 'media'),
+                        temperatura_lead = COALESCE($4, NULLIF(temperatura_lead, ''), 'Morno'),
+                        probabilidade    = COALESCE($5, NULLIF(probabilidade, 0), 30),
+                        proximo_passo    = COALESCE($6, NULLIF(proximo_passo, ''), 'Aguardar retorno do vendedor')
+                    WHERE id = $7
+                `, [
+                    ai.resumo_ia,
+                    ai.interesse_lead || null,
+                    ai.urgencia || null,
+                    ai.temperatura_lead || null,
+                    parseInt(ai.probabilidade) || null,
+                    ai.proximo_passo || null,
+                    lead.id
+                ]);
 
                 atualizados++;
-                logs.push(`ID ${lead.id} OK: "${resumoIA.substring(0, 50)}..."`);
+                logs.push(`ID ${lead.id} OK: "${ai.resumo_ia.substring(0, 60)}..."`);
+                console.log(`[Fill Missing] ID ${lead.id} OK`);
+
             } catch (err) {
                 logs.push(`ID ${lead.id} FAIL: ${err.message}`);
+                console.error(`[Fill Missing] ID ${lead.id} FAIL:`, err.message);
             }
         }
 
-        console.log(`--- [FILL MISSING END] ${atualizados} leads atualizados ---`);
+        console.log(`--- [FILL MISSING END] ${atualizados}/${leadsRes.rows.length} leads atualizados ---`);
         res.json({ success: true, total: leadsRes.rows.length, updatedCount: atualizados, details: logs });
     } catch (err) {
         console.error('[Fill Missing Error]', err);
