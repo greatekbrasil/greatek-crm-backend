@@ -394,6 +394,40 @@ app.get('/sync-history/:vendedor', async (req, res) => {
 
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
+// --- Helper: Chama Gemini com retry automático em caso de rate limit ---
+async function callGeminiWithRetry(prompt, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const geminiRes = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0.2 }
+                })
+            }
+        );
+        const data = await geminiRes.json();
+
+        if (!data.error) return data;
+
+        const isRateLimit = data.error.code === 429 ||
+            (data.error.message && data.error.message.toLowerCase().includes('quota'));
+
+        if (isRateLimit && attempt < maxRetries) {
+            const retryMatch = data.error.message?.match(/retry in ([0-9.]+)s/i);
+            const waitMs = retryMatch
+                ? Math.ceil(parseFloat(retryMatch[1])) * 1000 + 2000
+                : Math.pow(2, attempt) * 15000;
+            console.warn(`[Gemini] Rate limit na tentativa ${attempt}. Aguardando ${waitMs / 1000}s...`);
+            await sleep(waitMs);
+        } else {
+            return data;
+        }
+    }
+}
+
 // --- Rota Manual para Reanalisar Todos os Leads sem IA (Super Robusta) ---
 app.get('/reanalyze-all', async (req, res) => {
     try {
@@ -410,13 +444,13 @@ app.get('/reanalyze-all', async (req, res) => {
 
         for (const lead of leadsRes.rows) {
             try {
-                // Pequena pausa para respeitar a cota do Plano Gratuito
-                await sleep(3000); 
+                // Pausa de 4s entre leads para respeitar cota do plano gratuito (20 req/min)
+                await sleep(4000);
 
                 const remoteJid = `${lead.telefone}@s.whatsapp.net`;
                 const instance = lead.instancia_vendedor;
 
-                console.log(`[Sync] ${lead.telefone}...`);
+                console.log(`[Reanalyze] Processando lead ID ${lead.id} (${lead.telefone})...`);
                 const evRes = await fetch(`${EVOLUTION_API_URL}/chat/fetchMessages`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
@@ -503,6 +537,62 @@ app.get('/reanalyze-all', async (req, res) => {
         res.json({ success: true, updatedCount: atualizados, details: logs });
     } catch (err) {
         console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- Rota para Preencher Leads Vazios com o Resumo Bruto (Sem IA, sem rate limit) ---
+app.get('/fill-missing', async (req, res) => {
+    try {
+        console.log('--- [FILL MISSING START] ---');
+
+        // Busca todos os leads sem análise de IA
+        const leadsRes = await pool.query(`
+            SELECT id, resumo, nome_lead, instancia_vendedor
+            FROM leads_analisados 
+            WHERE resumo_ia IS NULL OR resumo_ia = '' OR resumo_ia LIKE '%Sem resumo%'
+            ORDER BY id DESC
+        `);
+
+        let atualizados = 0;
+        let logs = [];
+
+        for (const lead of leadsRes.rows) {
+            try {
+                // Usa o resumo bruto (texto da conversa) como descrição principal
+                // Se não houver resumo, usa um texto padrão
+                const textoBase = lead.resumo && lead.resumo.trim().length > 0
+                    ? lead.resumo.trim()
+                    : 'Lead recebido via WhatsApp. Sem mensagem inicial registrada.';
+
+                // Trunca para 300 caracteres para o resumo_ia
+                const resumoIA = textoBase.length > 300
+                    ? textoBase.substring(0, 297) + '...'
+                    : textoBase;
+
+                await pool.query(`
+                    UPDATE leads_analisados
+                    SET 
+                        resumo_ia        = $1,
+                        interesse_lead   = COALESCE(NULLIF(interesse_lead, ''), 'A definir'),
+                        urgencia         = COALESCE(NULLIF(urgencia, ''), 'media'),
+                        temperatura_lead = COALESCE(NULLIF(temperatura_lead, ''), 'Morno'),
+                        probabilidade    = COALESCE(NULLIF(probabilidade, 0), 30),
+                        proximo_passo    = COALESCE(NULLIF(proximo_passo, ''), 'Aguardar retorno do vendedor')
+                    WHERE id = $2
+                `, [resumoIA, lead.id]);
+
+                atualizados++;
+                logs.push(`ID ${lead.id} OK: "${resumoIA.substring(0, 50)}..."`);
+            } catch (err) {
+                logs.push(`ID ${lead.id} FAIL: ${err.message}`);
+            }
+        }
+
+        console.log(`--- [FILL MISSING END] ${atualizados} leads atualizados ---`);
+        res.json({ success: true, total: leadsRes.rows.length, updatedCount: atualizados, details: logs });
+    } catch (err) {
+        console.error('[Fill Missing Error]', err);
         res.status(500).json({ error: err.message });
     }
 });
